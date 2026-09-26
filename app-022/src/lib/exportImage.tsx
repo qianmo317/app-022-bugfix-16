@@ -17,6 +17,11 @@ function mm(v: number): number {
   return Math.round(v * PX_MM * 1000) / 1000;
 }
 
+/** 像素坐标同样保留 3 位小数，避免浮点噪声写进标记 */
+function px(v: number): number {
+  return Math.round(v * 1000) / 1000;
+}
+
 /** 组合单页 SVG 标记（width/height 用 mm，viewBox 用 px） */
 export function pageSvgMarkup(worksheet: Worksheet, pageIndex: number): string {
   const layout = clampLayout(worksheet.layout);
@@ -26,29 +31,34 @@ export function pageSvgMarkup(worksheet: Worksheet, pageIndex: number): string {
   const pinyinFor = pinyinResolver(worksheet);
 
   const mL = mm(PAGE.marginLMm);
+  const mR = mm(PAGE.wMm - PAGE.marginRMm);
   const headerTop = mm(PAGE.marginTMm);
-  const rowsTop = mm(PAGE.marginTMm);
+  // 与预览一致：行区从「上边距 + 页眉高」之后开始
+  const rowsTop = mm(PAGE.marginTMm + PAGE.headerMm);
   const rowHeight = mm(layout.cellMm * ROW_FACTOR);
   const gap = mm(layout.lineGapMm);
-  const scale = layout.cellMm / 100;
+  // unit（格=100）→ px：1 unit = cellMm/100 mm = cellMm/100 × PX_MM px
+  const scale = mm(layout.cellMm) / 100;
 
   const parts: string[] = [];
   parts.push(
-    `<text x="${mL}" y="${headerTop + 24}" font-family="${FONT_ATTR}" font-size="20" font-weight="700" fill="#222">${
+    `<text x="${mL}" y="${px(headerTop + 16)}" font-family="${FONT_ATTR}" font-size="16" font-weight="700" fill="#1f2328">${
       escapeXml(worksheet.title)
     }</text>`,
-  );
-  parts.push(
-    `<text x="${mm(PAGE.wMm - PAGE.marginRMm)}" y="${headerTop + 24}" text-anchor="end" font-family="${FONT_ATTR}" font-size="12" fill="#666">第 ${pi + 1} 页</text>`,
   );
   let y = rowsTop;
   for (const row of rows) {
     const inner = renderToStaticMarkup(
       <RowContent row={row} layout={layout} pinyinFor={pinyinFor} />,
     );
-    parts.push(`<g transform="translate(${mL} ${y}) scale(${scale})">${inner}</g>`);
+    parts.push(`<g transform="translate(${mL} ${px(y)}) scale(${scale})">${inner}</g>`);
     y += rowHeight + gap;
   }
+  // 页脚与预览一致：右对齐「第 X 页 / 共 Y 页」，位于最后一行之下
+  const footerY = rows.length > 0 ? y - gap + mm(2) + 10 : rowsTop + mm(2) + 10;
+  parts.push(
+    `<text x="${mR}" y="${px(footerY)}" text-anchor="end" font-family="${FONT_ATTR}" font-size="10" fill="#9ca3af">第 ${pi + 1} 页 / 共 ${pages.length} 页</text>`,
+  );
 
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="${PAGE.wMm}mm" height="${PAGE.hMm}mm" ` +
@@ -71,11 +81,33 @@ function download(blob: Blob, filename: string): void {
   a.href = url;
   a.download = filename;
   a.click();
-  URL.revokeObjectURL(url);
+  // 延迟回收：同步 revoke 会打断尚未开始的下载，产生空文件
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
-function baseName(worksheet: Worksheet): string {
-  return worksheet.title || '字帖';
+/** 文件系统保留字 → 全角，避免文件名被截断或保存失败 */
+const INVALID_FILENAME_CHARS: Record<string, string> = {
+  '/': '／',
+  '\\': '＼',
+  ':': '：',
+  '*': '＊',
+  '?': '？',
+  '"': '＂',
+  '<': '＜',
+  '>': '＞',
+  '|': '｜',
+};
+
+/** 标题 → 安全文件名主体：替换保留字符、去控制字符、限长，空则回退「字帖」 */
+export function baseName(worksheet: Worksheet): string {
+  const cleaned = (worksheet.title || '')
+    .replace(/[/\\:*?"<>|]/g, (c) => INVALID_FILENAME_CHARS[c])
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f]/g, '')
+    .trim()
+    .replace(/[. ]+$/, '') // Windows 不允许以点/空格结尾
+    .slice(0, 50);
+  return cleaned || '字帖';
 }
 
 /** 导出单页 SVG */
@@ -92,8 +124,9 @@ export function exportPng(worksheet: Worksheet, pageIndex: number, scale = 4): P
     const img = new Image();
     img.onerror = () => reject(new Error('PNG 导出失败：SVG 渲染错误'));
     img.onload = () => {
-      const w = Math.round(mm(PAGE.wMm) / scale);
-      const h = Math.round(mm(PAGE.hMm) / scale);
+      // 位图尺寸 = 页面 px × 倍率（4x ≈ 384dpi，打印不糊）
+      const w = Math.round(mm(PAGE.wMm) * scale);
+      const h = Math.round(mm(PAGE.hMm) * scale);
       const canvas = document.createElement('canvas');
       canvas.width = w;
       canvas.height = h;
@@ -109,7 +142,7 @@ export function exportPng(worksheet: Worksheet, pageIndex: number, scale = 4): P
           reject(new Error('PNG 编码失败'));
           return;
         }
-        download(blob, `${baseName(worksheet)}-${pageIndex + 1}.png`);
+        download(blob, `${baseName(worksheet)}-第${pageIndex + 1}页.png`);
         resolve();
       }, 'image/png');
     };
